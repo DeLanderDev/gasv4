@@ -1,18 +1,17 @@
 """
-Gas Price Predictor - Model Training & Prediction
-Ensemble of change-based models with auto-calibrated shrinkage.
+Gas Price Predictor - Hybrid Decomposition Model
 
-Key design decisions:
-  1. Predict weekly CHANGE (not absolute price)
-  2. Triple ensemble: XGBoost-full + XGBoost-selected + Ridge
-  3. Auto-calibrated shrinkage: dampens predictions toward zero
-     because models consistently over-predict change magnitude.
-     Optimized to maximize the ±$0.02 accuracy rate.
-  4. Recent-data weighting: last 40% of data gets 2x weight
+Architecture:
+  1) STL decomposition on historical gas prices
+  2) GRU sequence model forecasts trend + seasonal components
+  3) XGBoost forecasts residual component using engineered macro/market features
+  4) Ridge meta-learner stacks base forecasts into final absolute price
 """
 
 import json
+import pickle
 import warnings
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -20,13 +19,14 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.preprocessing import StandardScaler
 from xgboost import XGBRegressor
 
 from config import (
+    GRU_PARAMS,
     METRICS_FILE,
     MIN_TRAINING_WEEKS,
-    MODEL_FILE,
+    MODEL_BUNDLE_FILE,
+    STL_PERIOD,
     VALIDATION_WEEKS,
     XGBOOST_PARAMS,
 )
@@ -38,251 +38,313 @@ from feature_engine import (
 
 warnings.filterwarnings("ignore")
 
+try:
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import DataLoader, TensorDataset
+except Exception:  # pragma: no cover
+    torch = None
+    nn = None
+    DataLoader = None
+    TensorDataset = None
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Helpers
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _sample_weights(n: int, recent_frac: float = 0.4) -> np.ndarray:
-    """Recent data gets 2× weight; older data ramps from 0.5 → 1.0."""
-    w = np.ones(n)
-    cut = int(n * (1 - recent_frac))
-    w[:cut] = np.linspace(0.5, 1.0, cut)
-    w[cut:] = 2.0
-    return w
-
-
-def _top_features(X, y, names, top_n=35):
-    """Quick XGBoost to rank features, return top N names."""
-    m = XGBRegressor(**{**XGBOOST_PARAMS, "n_estimators": 100})
-    m.fit(X[names], y, verbose=False)
-    fi = pd.Series(m.feature_importances_, index=names)
-    return fi.sort_values(ascending=False).head(top_n).index.tolist()
+try:
+    from statsmodels.tsa.seasonal import STL
+except Exception:  # pragma: no cover
+    STL = None
 
 
-def _calibrate_shrinkage(
-    raw_pred_changes: np.ndarray,
-    actual_abs: np.ndarray,
-    base_prices: np.ndarray,
-    target_cents: float = 0.02,
-) -> float:
-    """
-    Find the shrinkage factor s ∈ [0, 1] that maximizes
-    the % of predictions within ±target_cents of actual.
-    
-    final_change = raw_change × s
-    prediction   = base_price + final_change
-    """
-    best_s = 0.0
-    best_rate = 0.0
-
-    for s in np.arange(0.0, 1.01, 0.02):
-        dampened = raw_pred_changes * s
-        pred_abs = base_prices + dampened
-        rate = (np.abs(pred_abs - actual_abs) <= target_cents).mean()
-        # Prefer higher shrinkage (more model signal) when tied
-        if rate > best_rate or (rate == best_rate and s > best_s):
-            best_rate = rate
-            best_s = s
-
-    return round(best_s, 2)
+@dataclass
+class DecompositionResult:
+    trend: np.ndarray
+    seasonal: np.ndarray
+    resid: np.ndarray
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Model
-# ═══════════════════════════════════════════════════════════════════════════════
+BaseNNModule = nn.Module if nn is not None else object
+
+
+class GRUForecaster(BaseNNModule):
+    """Simple GRU forecaster for 2-channel sequence: [trend, seasonal]."""
+
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int, dropout: float):
+        super().__init__()
+        if nn is None:
+            raise RuntimeError("PyTorch backend unavailable.")
+        self.gru = nn.GRU(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        self.head = nn.Linear(hidden_size, 2)
+
+    def forward(self, x):
+        out, _ = self.gru(x)
+        return self.head(out[:, -1, :])
+
 
 class GasPriceModel:
-    """
-    Ensemble gas price model predicting weekly CHANGE with shrinkage.
-
-    Sub-models:
-      1. XGBoost on all features
-      2. XGBoost on top-35 features (less overfit)
-      3. Ridge on top-35 features (linear regularized)
-
-    Pipeline:
-      raw_change = 0.40 × M1 + 0.35 × M2 + 0.25 × M3
-      final_change = raw_change × shrinkage
-      prediction = current_price + final_change
-    """
+    """STL + GRU + XGBoost residual model with stacking ensemble."""
 
     def __init__(self):
-        self.xgb_full: Optional[XGBRegressor] = None
-        self.xgb_sel: Optional[XGBRegressor] = None
-        self.ridge: Optional[Ridge] = None
-        self.scaler: Optional[StandardScaler] = None
+        self.sequence_length = int(GRU_PARAMS["sequence_length"])
+        self.backend = "gru" if torch is not None else "ridge-seq-fallback"
+        self.decomposition_mode = "stl" if STL is not None else "rolling-fallback"
+
+        self.gru: Optional[GRUForecaster] = None
+        self.residual_xgb: Optional[XGBRegressor] = None
+        self.meta_learner: Optional[Ridge] = None
 
         self.all_features: List[str] = []
-        self.sel_features: List[str] = []
-        self.ew = [0.40, 0.35, 0.25]  # ensemble weights
-
-        self.shrinkage: float = 0.5  # auto-tuned in train()
-        self.bias: float = 0.0       # auto-tuned in train()
         self.metrics: Dict = {}
         self.validation_results: Optional[pd.DataFrame] = None
         self.is_trained: bool = False
 
-    # ─── Data Prep ────────────────────────────────────────────────────────
+        self.last_components: Optional[DecompositionResult] = None
+        self.last_price_series: Optional[np.ndarray] = None
 
-    def _prep(self, df):
-        """Create features, return (X, y_change, y_abs, bases, feat_names, feat_df)."""
+    # ─── Decomposition + Sequence Helpers ───────────────────────────────
+
+    def _decompose(self, gas_prices: pd.Series) -> DecompositionResult:
+        if STL is not None:
+            stl = STL(gas_prices, period=STL_PERIOD, robust=True)
+            result = stl.fit()
+            return DecompositionResult(
+                trend=result.trend.values,
+                seasonal=result.seasonal.values,
+                resid=result.resid.values,
+            )
+
+        trend = gas_prices.rolling(13, center=True, min_periods=1).mean()
+        detrended = gas_prices - trend
+        week = np.arange(len(gas_prices)) % 52
+        seasonal_map = pd.Series(detrended).groupby(week).transform("mean")
+        resid = gas_prices - trend - seasonal_map
+        return DecompositionResult(
+            trend=trend.values,
+            seasonal=seasonal_map.values,
+            resid=resid.values,
+        )
+
+    def _build_seq_dataset(
+        self,
+        trend: np.ndarray,
+        seasonal: np.ndarray,
+        indices: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Build supervised windows for rows that predict t+1.
+        For feature row at index t, we predict components at t+1.
+        """
+        X_seq, y_seq, valid_rows = [], [], []
+        for t in indices:
+            if t - self.sequence_length + 1 < 0:
+                continue
+            target_idx = t + 1
+            if target_idx >= len(trend):
+                continue
+            seq = np.column_stack([
+                trend[t - self.sequence_length + 1:t + 1],
+                seasonal[t - self.sequence_length + 1:t + 1],
+            ])
+            y = np.array([trend[target_idx], seasonal[target_idx]], dtype=np.float32)
+            X_seq.append(seq.astype(np.float32))
+            y_seq.append(y)
+            valid_rows.append(t)
+
+        if not X_seq:
+            return np.empty((0, self.sequence_length, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32), np.empty((0,), dtype=int)
+
+        return np.array(X_seq), np.array(y_seq), np.array(valid_rows)
+
+    def _fit_gru(self, X_seq: np.ndarray, y_seq: np.ndarray, epochs: Optional[int] = None):
+        if torch is None:
+            self.backend = "ridge-seq-fallback"
+            proxy = Ridge(alpha=1.0)
+            proxy.fit(X_seq.reshape(len(X_seq), -1), y_seq)
+            return proxy
+
+        self.backend = "gru"
+        torch.manual_seed(int(GRU_PARAMS["random_state"]))
+        model = GRUForecaster(
+            input_size=2,
+            hidden_size=int(GRU_PARAMS["hidden_size"]),
+            num_layers=int(GRU_PARAMS["num_layers"]),
+            dropout=float(GRU_PARAMS["dropout"]),
+        )
+
+        ds = TensorDataset(torch.tensor(X_seq), torch.tensor(y_seq))
+        loader = DataLoader(ds, batch_size=int(GRU_PARAMS["batch_size"]), shuffle=True)
+
+        opt = torch.optim.Adam(model.parameters(), lr=float(GRU_PARAMS["learning_rate"]))
+        loss_fn = nn.HuberLoss()
+
+        n_epochs = int(epochs or GRU_PARAMS["epochs"])
+        model.train()
+        for _ in range(n_epochs):
+            for xb, yb in loader:
+                opt.zero_grad()
+                pred = model(xb)
+                loss = loss_fn(pred, yb)
+                loss.backward()
+                opt.step()
+        return model
+
+    @staticmethod
+    def _predict_gru(model, X_seq: np.ndarray) -> np.ndarray:
+        if torch is None or not hasattr(model, "state_dict"):
+            return model.predict(X_seq.reshape(len(X_seq), -1))
+        model.eval()
+        with torch.no_grad():
+            return model(torch.tensor(X_seq)).detach().numpy()
+
+    # ─── Data Prep ───────────────────────────────────────────────────────
+
+    def _prep(self, df: pd.DataFrame):
         fdf = create_features(df)
         names = get_feature_columns(fdf)
-        fdf["target_change"] = fdf["target"] - fdf["gas_price"]
-        v = fdf[names + ["target_change", "target", "gas_price"]].dropna()
-        return (
-            v[names], v["target_change"], v["target"],
-            v["gas_price"], names, fdf,
-        )
+        valid = fdf[names + ["target", "gas_price"]].dropna().copy()
 
-    def _raw_ensemble(self, X_row):
-        """Get raw ensemble change prediction for one or more rows."""
-        p1 = self.xgb_full.predict(X_row[self.all_features])
-        p2 = self.xgb_sel.predict(X_row[self.sel_features])
-        X_sc = self.scaler.transform(X_row[self.sel_features])
-        p3 = self.ridge.predict(X_sc)
-        return self.ew[0] * p1 + self.ew[1] * p2 + self.ew[2] * p3
+        # map valid rows back to original index (t predicting t+1)
+        valid_idx = valid.index.values
+        target = valid["target"].values
+        base = valid["gas_price"].values
+        return fdf, valid, names, valid_idx, target, base
 
-    # ─── Training ─────────────────────────────────────────────────────────
+    # ─── Training ────────────────────────────────────────────────────────
 
     def train(self, df: pd.DataFrame) -> Dict:
-        """Train ensemble and auto-calibrate shrinkage."""
-        X, y_chg, y_abs, bases, names, fdf = self._prep(df)
+        fdf, valid, names, valid_idx, y_abs, bases = self._prep(df)
 
-        if len(X) < MIN_TRAINING_WEEKS:
-            raise ValueError(f"Need {MIN_TRAINING_WEEKS} weeks, got {len(X)}.")
+        if len(valid) < MIN_TRAINING_WEEKS:
+            raise ValueError(f"Need {MIN_TRAINING_WEEKS} weeks, got {len(valid)}.")
 
         self.all_features = names
-        sw = _sample_weights(len(X))
 
-        # ── Fit 3 models on ALL data ──────────────────────────────────────
-        self.xgb_full = XGBRegressor(**XGBOOST_PARAMS)
-        self.xgb_full.fit(X, y_chg, sample_weight=sw, verbose=False)
+        # 1) STL decomposition on full observed gas price series
+        gas_series = fdf["gas_price"].astype(float)
+        comps = self._decompose(gas_series)
 
-        self.sel_features = _top_features(X, y_chg, names, top_n=35)
+        # 2) GRU predicts trend + seasonal for t+1
+        X_seq, y_seq, seq_rows = self._build_seq_dataset(comps.trend, comps.seasonal, valid_idx)
+        if len(X_seq) < 20:
+            raise ValueError("Not enough sequence windows for GRU training.")
 
-        self.xgb_sel = XGBRegressor(**XGBOOST_PARAMS)
-        self.xgb_sel.fit(
-            X[self.sel_features], y_chg, sample_weight=sw, verbose=False
-        )
+        self.gru = self._fit_gru(X_seq, y_seq)
+        gru_preds = self._predict_gru(self.gru, X_seq)
 
-        self.scaler = StandardScaler()
-        Xsc = self.scaler.fit_transform(X[self.sel_features])
-        self.ridge = Ridge(alpha=1.0)
-        self.ridge.fit(Xsc, y_chg, sample_weight=sw)
+        seq_to_valid_pos = {row: pos for pos, row in enumerate(valid_idx)}
+        valid_positions = [seq_to_valid_pos[r] for r in seq_rows if r in seq_to_valid_pos]
 
+        vsub = valid.iloc[valid_positions].copy()
+        y_sub = y_abs[valid_positions]
+
+        trend_season_pred = gru_preds[:, 0] + gru_preds[:, 1]
+
+        # 3) XGBoost predicts residual target: y - (pred_trend + pred_season)
+        residual_target = y_sub - trend_season_pred
+        self.residual_xgb = XGBRegressor(**XGBOOST_PARAMS)
+        self.residual_xgb.fit(vsub[self.all_features], residual_target, verbose=False)
+        residual_pred = self.residual_xgb.predict(vsub[self.all_features])
+
+        # 4) Stacking meta-learner combines components
+        base_sum = trend_season_pred + residual_pred
+        stack_X = np.column_stack([trend_season_pred, residual_pred, base_sum])
+        self.meta_learner = Ridge(alpha=1.0)
+        self.meta_learner.fit(stack_X, y_sub)
+        pred_abs = self.meta_learner.predict(stack_X)
+
+        pred_change = pred_abs - bases[valid_positions]
+        actual_change = y_sub - bases[valid_positions]
+
+        self.last_components = comps
+        self.last_price_series = gas_series.values
         self.is_trained = True
 
-        # ── Calibrate shrinkage on the most recent ~1 year ────────────────
-        cal_n = min(52, len(X) // 4)
-        cal_sl = slice(len(X) - cal_n, None)
-        raw_cal = self._raw_ensemble(X.iloc[cal_sl])
-        self.shrinkage = _calibrate_shrinkage(
-            raw_cal, y_abs.values[cal_sl], bases.values[cal_sl]
-        )
-
-        # ── Calibrate bias (mean residual after shrinkage) ────────────────
-        dampened_cal = raw_cal * self.shrinkage
-        pred_cal = bases.values[cal_sl] + dampened_cal
-        self.bias = float(np.mean(pred_cal - y_abs.values[cal_sl]))
-
-        # ── In-sample metrics (with shrinkage applied) ────────────────────
-        raw_all = self._raw_ensemble(X)
-        final_chg = raw_all * self.shrinkage - self.bias
-        pred_abs_all = bases.values + final_chg
-
         self.metrics = {
-            "mae": mean_absolute_error(y_abs, pred_abs_all),
-            "rmse": np.sqrt(mean_squared_error(y_abs, pred_abs_all)),
-            "r2": r2_score(y_abs, pred_abs_all),
-            "change_mae": mean_absolute_error(y_chg, final_chg),
-            "shrinkage": self.shrinkage,
-            "bias": round(self.bias, 5),
-            "n_samples": len(X),
-            "n_features": len(names),
-            "n_selected_features": len(self.sel_features),
+            "mae": mean_absolute_error(y_sub, pred_abs),
+            "rmse": np.sqrt(mean_squared_error(y_sub, pred_abs)),
+            "r2": r2_score(y_sub, pred_abs),
+            "change_mae": mean_absolute_error(actual_change, pred_change),
+            "n_samples": int(len(vsub)),
+            "n_features": int(len(names)),
+            "sequence_length": self.sequence_length,
             "trained_at": datetime.now().isoformat(),
+            "architecture": f"{self.decomposition_mode}->GRU(trend/seasonal)+XGBoost(residual)+Ridge(meta)",
+            "sequence_backend": self.backend,
         }
         return self.metrics
 
-    # ─── Walk-Forward Validation ──────────────────────────────────────────
+    # ─── Walk-Forward Validation ─────────────────────────────────────────
 
     def walk_forward_validate(self, df: pd.DataFrame) -> Tuple[Dict, pd.DataFrame]:
-        """
-        Walk-forward validation with per-step shrinkage calibration.
-        At each step:
-          1. Train ensemble on expanding window
-          2. Calibrate shrinkage on last 26 weeks of training data
-          3. Predict next week's change with shrinkage applied
-        """
-        X, y_chg, y_abs, bases, names, fdf = self._prep(df)
+        fdf, valid, names, valid_idx, y_abs, bases = self._prep(df)
+        n = len(valid)
 
-        n = len(X)
         test_n = min(VALIDATION_WEEKS, n // 3)
         test_start = n - test_n
-
         if test_start < MIN_TRAINING_WEEKS:
             raise ValueError("Not enough data for walk-forward validation.")
 
-        # Get dates aligned to valid rows
-        valid_idx = fdf[names + ["target_change", "target", "gas_price"]].dropna().index
         date_s = fdf.loc[valid_idx, "date"].reset_index(drop=True)
 
         preds_abs, acts_abs, preds_chg, acts_chg, dates = [], [], [], [], []
 
         for i in range(test_start, n):
-            Xtr, ytr = X.iloc[:i], y_chg.iloc[:i]
-            btr, atr = bases.iloc[:i], y_abs.iloc[:i]
-            sw = _sample_weights(len(Xtr))
+            train_rows = valid_idx[:i]
+            t = valid_idx[i]
+            train_df = fdf.iloc[:t + 1].copy()
 
-            # Fit 3 models
-            sel = _top_features(Xtr, ytr, names, top_n=35)
+            gas_series = train_df["gas_price"].astype(float)
+            comps = self._decompose(gas_series)
 
-            m1 = XGBRegressor(**XGBOOST_PARAMS)
-            m1.fit(Xtr, ytr, sample_weight=sw, verbose=False)
+            X_seq, y_seq, seq_rows = self._build_seq_dataset(comps.trend, comps.seasonal, train_rows)
+            if len(X_seq) < 15:
+                continue
 
-            m2 = XGBRegressor(**XGBOOST_PARAMS)
-            m2.fit(Xtr[sel], ytr, sample_weight=sw, verbose=False)
+            gru = self._fit_gru(X_seq, y_seq, epochs=40)
+            gru_preds = self._predict_gru(gru, X_seq)
 
-            sc = StandardScaler()
-            Xsc = sc.fit_transform(Xtr[sel])
-            m3 = Ridge(alpha=1.0)
-            m3.fit(Xsc, ytr, sample_weight=sw)
+            pos_map = {row: pos for pos, row in enumerate(train_rows)}
+            train_positions = [pos_map[r] for r in seq_rows if r in pos_map]
+            X_train = valid.iloc[:i].iloc[train_positions][names]
+            y_train = y_abs[:i][train_positions]
 
-            # Raw ensemble on calibration window (last 26 weeks of train)
-            cal_n = min(26, len(Xtr) // 4)
-            cal_sl = slice(len(Xtr) - cal_n, None)
+            trend_season_train = gru_preds[:, 0] + gru_preds[:, 1]
+            resid_train = y_train - trend_season_train
 
-            p1c = m1.predict(Xtr.iloc[cal_sl])
-            p2c = m2.predict(Xtr.iloc[cal_sl][sel])
-            p3c = m3.predict(sc.transform(Xtr.iloc[cal_sl][sel]))
-            raw_cal = self.ew[0] * p1c + self.ew[1] * p2c + self.ew[2] * p3c
+            xgb = XGBRegressor(**XGBOOST_PARAMS)
+            xgb.fit(X_train, resid_train, verbose=False)
+            resid_pred_train = xgb.predict(X_train)
 
-            # Calibrate shrinkage on calibration window
-            shrink = _calibrate_shrinkage(
-                raw_cal, atr.values[cal_sl], btr.values[cal_sl]
-            )
+            stack_train = np.column_stack([
+                trend_season_train,
+                resid_pred_train,
+                trend_season_train + resid_pred_train,
+            ])
+            meta = Ridge(alpha=1.0)
+            meta.fit(stack_train, y_train)
 
-            # Calibrate bias
-            damp_cal = raw_cal * shrink
-            bias = float(np.mean(btr.values[cal_sl] + damp_cal - atr.values[cal_sl]))
+            # predict point i
+            if t - self.sequence_length + 1 < 0:
+                continue
+            seq_test = np.column_stack([
+                comps.trend[t - self.sequence_length + 1:t + 1],
+                comps.seasonal[t - self.sequence_length + 1:t + 1],
+            ]).astype(np.float32)[None, :, :]
+            ts_pred = self._predict_gru(gru, seq_test)[0]
+            ts_sum = float(ts_pred[0] + ts_pred[1])
 
-            # Predict test point
-            X_test = X.iloc[i:i + 1]
-            p1 = m1.predict(X_test)[0]
-            p2 = m2.predict(X_test[sel])[0]
-            p3 = m3.predict(sc.transform(X_test[sel]))[0]
-            raw = self.ew[0] * p1 + self.ew[1] * p2 + self.ew[2] * p3
+            resid_pred = float(xgb.predict(valid.iloc[i:i + 1][names])[0])
+            pred = float(meta.predict(np.array([[ts_sum, resid_pred, ts_sum + resid_pred]]))[0])
 
-            final_chg = raw * shrink - bias
-            pred = bases.iloc[i] + final_chg
-
-            preds_chg.append(final_chg)
             preds_abs.append(pred)
-            acts_chg.append(y_chg.iloc[i])
-            acts_abs.append(y_abs.iloc[i])
-            dates.append(date_s.iloc[i] if i < len(date_s) else None)
+            acts_abs.append(float(y_abs[i]))
+            preds_chg.append(pred - float(bases[i]))
+            acts_chg.append(float(y_abs[i] - bases[i]))
+            dates.append(date_s.iloc[i])
 
         pa = np.array(preds_abs)
         aa = np.array(acts_abs)
@@ -290,8 +352,10 @@ class GasPriceModel:
         ac = np.array(acts_chg)
         errors = pa - aa
 
-        # Direction accuracy
-        base_arr = np.array([bases.iloc[test_start + j] for j in range(len(aa))])
+        if len(pa) == 0:
+            raise ValueError("Validation produced no predictions. Try more history.")
+
+        base_arr = np.array([bases[test_start + j] for j in range(len(aa))])
         act_dir = np.sign(aa - base_arr)
         pre_dir = np.sign(pa - base_arr)
         dir_acc = float(np.mean(act_dir == pre_dir) * 100) if len(aa) > 1 else 50.0
@@ -311,54 +375,64 @@ class GasPriceModel:
             "val_within_5_cents": float(np.mean(np.abs(errors) <= 0.05) * 100),
             "val_within_10_cents": float(np.mean(np.abs(errors) <= 0.10) * 100),
             "val_direction_accuracy": dir_acc,
+            "naive_within_2_cents": float(np.mean(np.abs(aa - base_arr) <= 0.02) * 100),
+            "naive_mae": float(np.mean(np.abs(aa - base_arr))),
         }
 
-        # Also compute naive baseline (predict no change)
-        naive_errors = aa - base_arr
-        val_metrics["naive_within_2_cents"] = float(
-            np.mean(np.abs(naive_errors) <= 0.02) * 100
-        )
-        val_metrics["naive_mae"] = float(np.mean(np.abs(naive_errors)))
-
         self.metrics.update(val_metrics)
-
-        self.validation_results = pd.DataFrame({
-            "date": dates,
-            "actual": acts_abs,
-            "predicted": preds_abs,
-            "error": errors.tolist(),
-            "abs_error": np.abs(errors).tolist(),
-        })
+        self.validation_results = pd.DataFrame(
+            {
+                "date": dates,
+                "actual": acts_abs,
+                "predicted": preds_abs,
+                "error": errors.tolist(),
+                "abs_error": np.abs(errors).tolist(),
+            }
+        )
 
         return val_metrics, self.validation_results
 
-    # ─── Prediction ───────────────────────────────────────────────────────
+    # ─── Prediction ──────────────────────────────────────────────────────
 
     def predict_next_week(self, df: pd.DataFrame) -> Dict:
-        """Predict next Sunday's gas price using calibrated ensemble."""
         if not self.is_trained:
             raise ValueError("Model must be trained before prediction.")
 
         fdf = create_features(df)
         row = prepare_prediction_row(fdf)
 
-        # Fill any missing columns
         for c in self.all_features:
             if c not in row.columns:
                 row[c] = 0
 
-        # Raw ensemble change
-        raw = self._raw_ensemble(row)[0]
+        gas_series = fdf["gas_price"].astype(float)
+        comps = self._decompose(gas_series)
 
-        # Apply shrinkage + bias correction
-        final_change = raw * self.shrinkage - self.bias
+        t = len(gas_series) - 1
+        if t - self.sequence_length + 1 < 0:
+            raise ValueError("Not enough history for sequence prediction.")
+
+        seq = np.column_stack([
+            comps.trend[t - self.sequence_length + 1:t + 1],
+            comps.seasonal[t - self.sequence_length + 1:t + 1],
+        ]).astype(np.float32)[None, :, :]
+
+        ts_pred = self._predict_gru(self.gru, seq)[0]
+        trend_pred = float(ts_pred[0])
+        seasonal_pred = float(ts_pred[1])
+        trend_season_sum = trend_pred + seasonal_pred
+
+        residual_pred = float(self.residual_xgb.predict(row[self.all_features])[0])
+        prediction = float(
+            self.meta_learner.predict(
+                np.array([[trend_season_sum, residual_pred, trend_season_sum + residual_pred]])
+            )[0]
+        )
 
         current_price = float(df["gas_price"].iloc[-1])
-        current_date = df["date"].iloc[-1]
-        prediction = current_price + final_change
+        final_change = prediction - current_price
         pct_change = (final_change / current_price) * 100
 
-        # Confidence intervals
         std_err = self.metrics.get("val_std_error", 0.02)
         ci_68 = (prediction - std_err, prediction + std_err)
         ci_95 = (prediction - 1.96 * std_err, prediction + 1.96 * std_err)
@@ -371,57 +445,65 @@ class GasPriceModel:
 
         return {
             "prediction": round(prediction, 4),
-            "raw_prediction": round(current_price + raw, 4),
+            "raw_prediction": round(trend_season_sum + residual_pred, 4),
             "predicted_change": round(final_change, 4),
-            "raw_change": round(raw, 5),
+            "raw_change": round((trend_season_sum + residual_pred) - current_price, 5),
             "current_price": round(current_price, 4),
-            "current_date": current_date,
+            "current_date": df["date"].iloc[-1],
             "predicted_pct_change": round(pct_change, 3),
-            "direction": (
-                "UP" if final_change > 0.001
-                else ("DOWN" if final_change < -0.001 else "FLAT")
-            ),
+            "direction": "UP" if final_change > 0.001 else ("DOWN" if final_change < -0.001 else "FLAT"),
             "ci_68_low": round(ci_68[0], 4),
             "ci_68_high": round(ci_68[1], 4),
             "ci_95_low": round(ci_95[0], 4),
             "ci_95_high": round(ci_95[1], 4),
             "std_error": round(std_err, 4),
-            "shrinkage": self.shrinkage,
-            "direction_accuracy": round(
-                self.metrics.get("val_direction_accuracy", 50), 1
-            ),
+            "shrinkage": "N/A (stacking used)",
+            "direction_accuracy": round(self.metrics.get("val_direction_accuracy", 50), 1),
             "prediction_date": next_sun.strftime("%Y-%m-%d"),
             "prediction_day": next_sun.strftime("%A, %B %d, %Y"),
-            "model_1_change": round(float(
-                self.xgb_full.predict(row[self.all_features])[0]
-            ), 5),
-            "model_2_change": round(float(
-                self.xgb_sel.predict(row[self.sel_features])[0]
-            ), 5),
-            "model_3_change": round(float(
-                self.ridge.predict(
-                    self.scaler.transform(row[self.sel_features])
-                )[0]
-            ), 5),
+            "model_1_change": round(trend_pred - current_price, 5),
+            "model_2_change": round(seasonal_pred, 5),
+            "model_3_change": round(residual_pred, 5),
         }
 
-    # ─── Feature Importance ───────────────────────────────────────────────
+    # ─── Feature Importance ──────────────────────────────────────────────
 
     def get_feature_importance(self, top_n: int = 25) -> pd.DataFrame:
-        if not self.is_trained or self.xgb_full is None:
+        if not self.is_trained or self.residual_xgb is None:
             return pd.DataFrame()
-        fi = pd.DataFrame({
-            "feature": self.all_features,
-            "importance": self.xgb_full.feature_importances_,
-        }).sort_values("importance", ascending=False)
+        fi = pd.DataFrame(
+            {
+                "feature": self.all_features,
+                "importance": self.residual_xgb.feature_importances_,
+            }
+        ).sort_values("importance", ascending=False)
         return fi.head(top_n)
 
-    # ─── Persistence ──────────────────────────────────────────────────────
+    # ─── Persistence ─────────────────────────────────────────────────────
 
     def save_model(self):
-        MODEL_FILE.parent.mkdir(parents=True, exist_ok=True)
-        if self.xgb_full is not None:
-            self.xgb_full.save_model(str(MODEL_FILE))
+        MODEL_BUNDLE_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+        bundle = {
+            "residual_xgb": self.residual_xgb,
+            "meta_learner": self.meta_learner,
+            "all_features": self.all_features,
+            "metrics": self.metrics,
+            "is_trained": self.is_trained,
+            "sequence_length": self.sequence_length,
+            "gru_state_dict": self.gru.state_dict() if (self.gru is not None and hasattr(self.gru, "state_dict")) else None,
+            "gru_fallback_model": self.gru if (self.gru is not None and not hasattr(self.gru, "state_dict")) else None,
+            "gru_config": {
+                "input_size": 2,
+                "hidden_size": int(GRU_PARAMS["hidden_size"]),
+                "num_layers": int(GRU_PARAMS["num_layers"]),
+                "dropout": float(GRU_PARAMS["dropout"]),
+            },
+        }
+
+        with open(MODEL_BUNDLE_FILE, "wb") as f:
+            pickle.dump(bundle, f)
+
         if self.metrics:
             safe = {}
             for k, v in self.metrics.items():
@@ -435,17 +517,37 @@ class GasPriceModel:
                 json.dump(safe, f, indent=2, default=str)
 
     def load_model(self) -> bool:
-        if MODEL_FILE.exists() and METRICS_FILE.exists():
-            try:
-                self.xgb_full = XGBRegressor()
-                self.xgb_full.load_model(str(MODEL_FILE))
-                with open(METRICS_FILE) as f:
-                    self.metrics = json.load(f)
-                self.all_features = list(
-                    self.xgb_full.get_booster().feature_names or []
+        if not MODEL_BUNDLE_FILE.exists():
+            return False
+
+        try:
+            with open(MODEL_BUNDLE_FILE, "rb") as f:
+                bundle = pickle.load(f)
+
+            self.residual_xgb = bundle.get("residual_xgb")
+            self.meta_learner = bundle.get("meta_learner")
+            self.all_features = bundle.get("all_features", [])
+            self.metrics = bundle.get("metrics", {})
+            self.is_trained = bundle.get("is_trained", False)
+            self.sequence_length = int(bundle.get("sequence_length", GRU_PARAMS["sequence_length"]))
+
+            if torch is not None and bundle.get("gru_state_dict") is not None:
+                cfg = bundle.get("gru_config", {})
+                self.gru = GRUForecaster(
+                    input_size=int(cfg.get("input_size", 2)),
+                    hidden_size=int(cfg.get("hidden_size", GRU_PARAMS["hidden_size"])),
+                    num_layers=int(cfg.get("num_layers", GRU_PARAMS["num_layers"])),
+                    dropout=float(cfg.get("dropout", GRU_PARAMS["dropout"])),
                 )
-                self.is_trained = True
-                return True
-            except Exception:
-                return False
-        return False
+                self.gru.load_state_dict(bundle["gru_state_dict"])
+                self.gru.eval()
+            else:
+                self.gru = bundle.get("gru_fallback_model")
+
+            if METRICS_FILE.exists():
+                with open(METRICS_FILE) as f:
+                    self.metrics.update(json.load(f))
+
+            return self.is_trained
+        except Exception:
+            return False
