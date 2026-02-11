@@ -1,6 +1,6 @@
 # ⛽ US Gas Price Predictor
 
-Predicts the AAA national average regular gasoline price for every Sunday at 11:59 PM ET, using a **change-based ensemble model** with **auto-calibrated shrinkage** and **106 features** from 3 free data sources.
+Predicts the AAA national average regular gasoline price for every Sunday at 11:59 PM ET, using a **decomposition-based hybrid ensemble** with **STL + GRU + XGBoost + stacking** and 100+ engineered features from 3 free data sources.
 
 ---
 
@@ -29,26 +29,31 @@ Enter your API key(s) in the sidebar. Optionally enter today's AAA national aver
 
 ## 🤖 Model Architecture
 
-### Change-Based Prediction
+### Decomposition-Based Hybrid Prediction
 
-Instead of predicting the absolute price (~$2.90, needing <0.7% error to hit ±$0.02), the model predicts the weekly **change** (~±$0.02). This is a fundamentally easier problem.
+The model first decomposes weekly gasoline prices into:
 
-### Triple Ensemble
+- **Trend** (long-run level shifts)
+- **Seasonality** (calendar/weekly cyclic effects)
+- **Residual** (idiosyncratic shocks)
 
-| Model | Features | Weight | Purpose |
-|-------|----------|--------|---------|
-| XGBoost (full) | All 106 | 40% | Complex nonlinear patterns |
-| XGBoost (selected) | Top 35 | 35% | Reduces overfitting |
-| Ridge Regression | Top 35 | 25% | Regularized linear baseline |
+Then it trains specialized learners for each signal:
 
-### Auto-Calibrated Shrinkage
+| Stage | Model | Role |
+|-------|-------|------|
+| 1 | STL decomposition | Split price series into trend / seasonal / residual components |
+| 2 | GRU sequence model | Forecast next-week trend + seasonal components |
+| 3 | XGBoost | Predict residual component from engineered FRED/EIA/Yahoo features |
+| 4 | Ridge meta-learner (stacking) | Combine component-level predictions into final price forecast |
 
-ML models over-predict the *magnitude* of changes. The model automatically finds the optimal dampening factor on recent data to maximize ±$0.02 accuracy:
+This keeps the time-series structure in a recurrent model while still exploiting rich exogenous feature interactions in XGBoost.
+
+### Ensemble Output
 
 ```
-raw_change  = 0.40 × XGB_full + 0.35 × XGB_selected + 0.25 × Ridge
-final_change = raw_change × shrinkage − bias
-prediction   = current_price + final_change
+trend_season_hat = GRU(trend, seasonal history)
+residual_hat     = XGBoost(features)
+final_price      = MetaLearner([trend_season_hat, residual_hat, trend_season_hat + residual_hat])
 ```
 
 ### Recent-Data Weighting
@@ -131,7 +136,7 @@ gas_price_predictor/
 ├── app.py              # Streamlit dashboard (5 tabs)
 ├── data_collector.py   # EIA + Yahoo Finance + FRED data fetching
 ├── feature_engine.py   # 106-feature engineering pipeline
-├── model.py            # Ensemble model with shrinkage calibration
+├── model.py            # STL + GRU + XGBoost residual hybrid + stacking
 ├── config.py           # All settings, series IDs, and constants
 ├── requirements.txt    # Python dependencies
 └── README.md

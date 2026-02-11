@@ -15,6 +15,7 @@ MODEL_DIR.mkdir(exist_ok=True)
 
 CACHE_FILE = DATA_DIR / "cached_data.parquet"
 MODEL_FILE = MODEL_DIR / "xgb_model.json"
+MODEL_BUNDLE_FILE = MODEL_DIR / "hybrid_model.pkl"
 METRICS_FILE = MODEL_DIR / "metrics.json"
 
 # ─── API Keys ─────────────────────────────────────────────────────────────────
@@ -87,6 +88,19 @@ XGBOOST_PARAMS = {
     "reg_lambda": 1.0,
     "random_state": 42,
 }
+
+GRU_PARAMS = {
+    "sequence_length": 12,
+    "hidden_size": 32,
+    "num_layers": 1,
+    "dropout": 0.0,
+    "learning_rate": 0.01,
+    "epochs": 120,
+    "batch_size": 16,
+    "random_state": 42,
+}
+
+STL_PERIOD = 52
 
 VALIDATION_WEEKS = 26
 MIN_TRAINING_WEEKS = 52
